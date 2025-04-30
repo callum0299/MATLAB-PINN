@@ -1,0 +1,484 @@
+clc; clear; close all;
+
+Problem Parameters - General
+L = 2; % Length of domain
+nu = 0.01 / pi; % Viscosity term (constant)
+ng = 100; % Number of grid points
+
+dt = 0.001; % Time step
+nt = round(1 ./ dt); % Compute nt for each dt
+
+numObservationsTrain = 10; % Number of observations
+
+Problem Parameters - Initial Condition
+xVals = linspace(-1, 1, ng);
+u0IC = -sin(pi * xVals);
+
+Problem Parameters - PINN
+nc = 20; % percentage of timesteps to have boundary conditions
+numBoundaryConditionPoints = [nc, nc];
+numInternalCollocationPoints = 10000;
+numBlocks = 8;
+fcOutputSize = 20;
+
+maxIterations = 100000;
+gradientTolerance = 1e-4;
+stepTolerance = 1e-6;
+
+physicsloss = 1;
+boundaryloss = 5;
+
+Problem Parameters - Calculations
+dx = L / (ng - 1);
+CFL = max(abs(u0IC)) * dt / dx;
+
+if CFL > 1
+error('Time step is too large for stability. Decrease dt or increase dx.');
+end
+
+FDM - Calculation
+U0 = u0IC;
+U1 = U0;
+U_FDM = ones(nt, ng-2);
+
+for j = 1:nt
+for i = 2:ng-1
+U1(i) = U0(i) - dt * U0(i) * (U0(i) - U0(i-1)) / dx + nu * dt * (U0(i+1) - 2*U0(i) + U0(i-1)) / dx^2;
+end
+U_FDM(j, :) = U1(2:end-1);
+U0 = U1;
+end
+
+PINN - Boundary Conditions and data formatting
+xMin = -1; xMax = 1;
+
+x0BC1 = xMin * ones(1, numBoundaryConditionPoints(1));
+x0BC2 = xMax * ones(1, numBoundaryConditionPoints(2));
+t0BC1 = linspace(0, dt * nt, numBoundaryConditionPoints(1));
+t0BC2 = linspace(0, dt * nt, numBoundaryConditionPoints(2));
+u0BC1 = zeros(1, numBoundaryConditionPoints(1));
+u0BC2 = zeros(1, numBoundaryConditionPoints(2));
+
+% Combine Initial and Boundary Condition Points
+X0 = [xVals, x0BC1, x0BC2];
+T0 = [zeros(1, ng), t0BC1, t0BC2];
+U0 = [u0IC, u0BC1, u0BC2];
+
+% Collocation Points
+points = rand(numInternalCollocationPoints, 2);
+dataX = (xMax - xMin) * points(:,1) + xMin;
+dataT = dt * nt * points(:,2);
+
+% Convert to deep learning array
+X = dlarray(dataX, "BC");
+T = dlarray(dataT, "BC");
+
+X0 = dlarray(X0, "CB");
+T0 = dlarray(T0, "CB");
+U0 = dlarray(U0, "CB");
+
+PINN - Neural Network Structure
+fcBlock = [
+fullyConnectedLayer(fcOutputSize)
+tanhLayer
+];
+layers = [
+featureInputLayer(2) % 2 inputs: x, t
+repmat(fcBlock, [numBlocks, 1])
+fullyConnectedLayer(1)
+];
+net = dlnetwork(layers);
+net = dlupdate(@double, net);
+
+PINN - Learning Conditions
+solverState = lbfgsState;
+accfun = dlaccelerate(@modelLoss);
+lossFcn = @(net) dlfeval(accfun, net, nu, X, T, X0, T0, U0, boundaryloss, physicsloss);
+monitor = trainingProgressMonitor( Metrics="TrainingLoss", Info=["Iteration" "GradientsNorm" "StepNorm"], XLabel="Iteration");
+
+PINN - Iteration Loop
+monitor.Metrics = ["TrainingLoss", "GradientsNorm", "StepNorm"];
+iteration = 0;
+while iteration < maxIterations && ~monitor.Stop
+    iteration = iteration + 1;
+    [net, solverState] = lbfgsupdate(net, lossFcn, solverState);
+    
+    updateInfo(monitor, Iteration=iteration, GradientsNorm=solverState.GradientsNorm, StepNorm=solverState.StepNorm);
+    recordMetrics(monitor, iteration, TrainingLoss=solverState.Loss, GradientsNorm=solverState.GradientsNorm, StepNorm=solverState.StepNorm);
+    
+    monitor.Progress = 100 * iteration / maxIterations;
+    
+    if solverState.GradientsNorm < gradientTolerance || solverState.StepNorm < stepTolerance
+        break;
+    end
+end
+
+Extract Predictions for Full Domain
+TTrain = linspace(0, dt * nt, nt);
+XTrain = dlarray(xVals, "CB");
+UPredTrain = zeros(nt, ng);
+
+for i = 1:nt
+TTrain_i = repmat(TTrain(i), [1, ng]);
+TTrain_i = dlarray(TTrain_i, "CB");
+XTTTrain = cat(1, XTrain, TTrain_i);
+UPredTrain(i, :) = extractdata(forward(net, XTTTrain));
+end
+
+Plot - 3D FDM
+figure;
+x_values = xVals(2:end-1);
+y_values = (1:nt) * dt;
+[X, Y] = meshgrid(x_values, y_values);
+surf(X, Y, U_FDM);
+xlabel('x'); 
+ylabel('t'); 
+zlabel('u(x,t)');
+colorbar; shading interp;
+saveas(gcf, 'burger_final.png');
+
+Plot - 3D Intergal Method
+% Define time steps for plotting
+t_values = linspace(0, dt * nt, nt); % Create a time vector for plotting
+x_values = linspace(-1, 1, ng); % Define x-values from -1 to 1 for plotting
+
+% Call solveBurgers for each time step
+U_test = zeros(nt, ng); % Initialize an array to store the results
+for i = 1:nt
+U_test(i, :) = solveBurgers(x_values, t_values(i), nu); % Solve for velocity at each time step
+end
+
+% Create a 3D plot for the solution
+figure;
+[X, Y] = meshgrid(x_values, t_values); % Create meshgrid for plotting
+
+% Plot the velocity distribution over time (solution to Burgers' equation)
+surf(X, Y, U_test); % U_test contains the solution for each time step
+xlabel('x');
+ylabel('t');
+zlabel('u(x,t)');
+colorbar; % Add color bar for reference
+shading interp; % Interpolate the color transitions for smooth appearance
+saveas(gcf, 'burger_final_integral.png');
+
+Plot - Collocation Points
+figure
+hold on
+
+% Internal collocation points
+scatter(dataX, dataT, 5, 'r', 'filled', 'MarkerEdgeColor', 'k', 'MarkerFaceColor', 'r');
+
+% Boundary condition points in blue
+%scatter(x0BC1, t0BC1, 20, 'b', 'filled')
+%scatter(x0BC2, t0BC2, 20, 'b', 'filled')
+
+xlabel('x');
+ylabel('t');
+grid on
+hold off
+saveas(gcf, 'burger_collocation_and_boundary.png');
+
+Plot - Training FDM vs PINN
+timeSlices = round(linspace(1, nt, numObservationsTrain));
+timeSlices(1) = timeSlices(1) + 1
+
+for i = 1:numObservationsTrain
+    figure;
+    timeIndex = timeSlices(i);
+    plot(xVals(2:end-1), U_FDM(timeIndex, :), 'b-', 'LineWidth', 3);
+    hold on;
+    plot(xVals, U_test(timeIndex, :), 'g-', 'LineWidth', 1);
+    hold on
+    plot(xVals, UPredTrain(timeIndex, :), 'r--', 'LineWidth', 2);
+    %title(['Training Comparison at t = ', num2str(TTrain(timeIndex), '%.2f'), ' s']);
+    ylim([-1,1])
+    xlabel('x'); 
+    ylabel(['u(x,', num2str(TTrain(timeIndex), '%.2f'), ')']);
+    legend('FDM','Analytical', 'PINN');
+    grid on;
+    filename = sprintf('burger_solution_at_t_%d.png', timeIndex);  % Saves as PNG
+    saveas(gcf, filename);
+end
+
+Plot - PINN solution over time
+figure;
+hold on;
+colors = lines(numObservationsTrain); % Generates distinct colors
+
+% Loop through each time slice
+for i = 1:numObservationsTrain
+    timeIndex = timeSlices(i);
+    
+    % PINN plot
+    plot(xVals, UPredTrain(timeIndex, :), 'Color', colors(i, :), 'LineWidth', 2);
+    
+    % Add legend entry
+    legendEntries{i} = ['t = ', num2str(TTrain(timeIndex), '%.2f'), ' s'];
+end
+
+% Add labels and title
+xlabel('x');
+ylabel('u(x,t)');
+ylim([-1,1]);
+legend(legendEntries, 'Location', 'Best');
+grid on;
+hold off;
+saveas(gcf, 'burger_solution_over_time.png');
+
+Plot - L2 Error vs spatial
+% Error vs Spatial Step at Observation Locations (up to 0.33s)
+figure;
+hold on;
+colors = lines(numObservationsTrain); % Generate distinct colors for each observation
+
+% Find the time indices up to 0.33s
+validTimeIndices = TTrain(timeSlices) <= 1;
+
+for i = 1:numObservationsTrain
+    if ~validTimeIndices(i)
+        continue;
+    end
+    
+    timeIndex = timeSlices(i); % Get the index for each observation
+    predicted_velocity = UPredTrain(timeIndex, :);
+    true_velocity = U_test(timeIndex, :);
+    spatial_error = abs(predicted_velocity - true_velocity) ./ abs(true_velocity); % Normalized error at each spatial point
+    
+    plot(xVals, spatial_error, 'Color', colors(i, :), 'LineWidth', 2);
+end
+
+xlabel('x');
+ylabel('Relative Error');
+legend(arrayfun(@(idx) sprintf('t = %.2f s', TTrain(timeSlices(idx))), find(validTimeIndices), 'UniformOutput', false), 'Location', 'best');
+grid on;
+hold off;
+saveas(gcf, 'burger_spatial_L2.png');
+
+Plot - ABS error vs spatial
+figure;
+hold on;
+colors = lines(numObservationsTrain); % Color map for multiple plots
+legendEntries = cell(1, numObservationsTrain); % Pre-allocate legend entries
+
+for i = 1:numObservationsTrain
+    timeIndex = timeSlices(i);
+    
+    % Ensure that timeIndex corresponds to the available time steps
+    predicted_velocity = UPredTrain(timeIndex, :); % Predicted velocity (PINN)
+    true_velocity = U_test(timeIndex, :); % True velocity (FDM)
+    
+    % Calculate absolute error
+    spatial_error = abs(predicted_velocity - true_velocity);
+   
+    % Plot error vs spatial step
+    plot(xVals, spatial_error, 'Color', colors(i, :), 'LineWidth', 2);
+    
+    % Store legend entry for this time slice
+    legendEntries{i} = sprintf('t = %.2f s', TTrain(timeIndex));
+end
+
+xlabel('x');
+ylabel('Absolute Error');
+legend(legendEntries, 'Location', 'best'); % Use stored legend entries
+grid on;
+hold off;
+saveas(gcf, 'burger_spatial_abs.png');
+
+Plot - L2 Error vs Temporal
+l2_error_vals = zeros(nt, 1);
+
+for i = 1:nt
+predicted_velocity = UPredTrain(i, :);
+true_velocity = U_test(i, :);
+l2_error_vals(i) = norm(predicted_velocity - true_velocity, 2) / norm(true_velocity, 2);
+end
+
+figure;
+plot(TTrain, l2_error_vals, 'r-', 'LineWidth', 2);
+xlabel('t');
+ylabel('Relative L2 Norm Error');
+grid on;
+saveas(gcf, 'burger_temporal_L2.png');
+
+Plot - ABS Error vs Temporal
+abs_error_vals = zeros(nt, 1);
+
+for i = 1:nt
+predicted_velocity = UPredTrain(i, :);
+true_velocity = U_test(i, :);
+abs_error_vals(i) = norm(predicted_velocity - true_velocity, 2);
+end
+
+figure;
+plot(TTrain, abs_error_vals, 'b-', 'LineWidth', 2);
+xlabel('t');
+ylabel('L2 Norm Error');
+grid on;
+saveas(gcf, 'burger_temporal_abs.png');
+
+Plot - Full L2 error
+% Calculate L2 error over the whole domain at each time step up to 0.33s
+
+l2_error_map = zeros(nt, ng);
+
+for i = 1:nt
+predicted_velocity = UPredTrain(i, :);
+true_velocity = U_test(i, :);
+l2_error_map(i, :) = abs(predicted_velocity - true_velocity) ./ abs(true_velocity);
+end
+
+% Create the heatmap plot
+figure;
+imagesc(xVals, TTrain, l2_error_map);
+colorbar;
+xlabel('x');
+ylabel('t');
+set(gca, 'YDir', 'normal'); % Ensures time axis goes from top to bottom
+colormap(parula);
+saveas(gcf, 'burger_domain_L2.png');
+
+Plot - Full Abs Error
+% Calculate Absolute Error over the whole domain at each time step up to 0.33s
+abs_error_map = zeros(nt, ng); % Initialize a matrix to store the absolute error
+
+for i = 1:nt
+predicted_velocity = UPredTrain(i, :);
+true_velocity = U_test(i, :);
+abs_error_map(i, :) = abs(predicted_velocity - true_velocity); % Absolute error
+end
+
+% Create the heatmap plot
+figure;
+imagesc(xVals, TTrain, abs_error_map);
+colorbar;
+xlabel('x');
+ylabel('t');
+set(gca, 'YDir', 'normal'); % Ensures time axis goes from top to bottom
+colormap(parula); % You can change the colormap to any other if needed (e.g., jet, hot, etc.)
+saveas(gcf, 'burger_domain_abs.png');
+
+Plot - L2 error vs Iterations
+l2_errors = [];
+
+% Compute the L2 norm error for each iteration
+for iter = 1:maxIterations
+if iter > size(UPredTrain, 1)
+break;
+end
+predicted_velocity = UPredTrain(iter,:);
+true_velocity = U_test(iter, :);
+l2_errors(end+1) = norm(predicted_velocity - true_velocity, 2) / norm(true_velocity, 2);
+end
+
+% Plot the L2 norm error over iterations
+figure;
+plot(1:length(l2_errors), l2_errors, 'b-', 'LineWidth', 2);
+xlabel('Iteration Number');
+ylabel('L2 Norm Error');
+grid on;
+saveas(gcf, 'burger_iterations_L2.png');
+
+Plot - Training loss
+figure;
+plot(monitor.MetricData.TrainingLoss(:,1),monitor.MetricData.TrainingLoss(:,2))
+grid on
+set(gca, 'MinorGridLineStyle', 'none')
+set(gca, 'XScale', 'log')
+set(gca, 'YScale', 'log')
+xlabel('Iteration')
+ylabel('Training Loss')
+
+xticks([1e0 1e1 1e2 1e3 1e4 1e5])
+yticks([1e-6 1e-5 1e-4 1e-3 1e-2 1e-1 1e0 1e1])
+saveas(gcf, 'burger_training_loss.png');
+
+Plot - Grad Norm
+figure;
+plot(monitor.MetricData.GradientsNorm(:,1),monitor.MetricData.GradientsNorm(:,2))
+grid on
+set(gca, 'MinorGridLineStyle', 'none')
+set(gca, 'XScale', 'log')
+set(gca, 'YScale', 'log')
+xlabel('Iteration')
+ylabel('Gradient Norm')
+
+xticks([1e0 1e1 1e2 1e3 1e4 1e5])
+yticks([1e-6 1e-5 1e-4 1e-3 1e-2 1e-1 1e0 1e1])
+saveas(gcf, 'burger_training_grad.png');
+
+Plot - Step Norm
+figure;
+plot(monitor.MetricData.StepNorm(:,1),monitor.MetricData.StepNorm(:,2))
+grid on
+set(gca, 'MinorGridLineStyle', 'none')
+set(gca, 'XScale', 'log')
+set(gca, 'YScale', 'log')
+xlabel('Iteration')
+ylabel('Step Norm')
+
+xticks([1e0 1e1 1e2 1e3 1e4 1e5])
+yticks([1e-6 1e-5 1e-4 1e-3 1e-2 1e-1 1e0 1e1])
+saveas(gcf, 'burger_training_step.png');
+
+L2 Norm Calculation
+Total_L2 = norm(UPredTrain(2:nt,:) - U_test(2:nt,:), 'fro')/ norm(U_test(2:nt,:), 'fro');
+
+% Create an invisible figure and annotation
+figure('Visible', 'off');
+annotation('textbox', [0.1, 0.9, 0.8, 0.1], 'String', ...
+sprintf(' %.6f', Total_L2), ...
+'FontSize', 14, 'FontWeight', 'bold', 'EdgeColor', 'none');
+
+% Make the figure visible before plotting
+set(gcf, 'Visible', 'on');
+
+PINN Loss Function
+function [loss, gradients] = modelLoss(net, nu, X, T, X0, T0, U0, boundaryloss, physicsloss)
+XTK = cat(1, X, T);
+U = forward(net, XTK);
+
+X = stripdims(X);
+T = stripdims(T);
+U = stripdims(U);
+Ux = dljacobian(U, X, 1);
+Ut = dljacobian(U, T, 1);
+Uxx = dldivergence(Ux, X, 1);
+
+% Burgers' equation residual
+f = Ut + U .* Ux - (nu) * Uxx;
+mseF = physicsloss * mean(f.^2);
+
+% Boundary Condition Loss
+XTK0 = cat(1, X0, T0);
+U0Pred = forward(net, XTK0);
+mseU = boundaryloss * l2loss(U0Pred, U0);
+
+% Total Loss
+loss = mseF + mseU;
+gradients = dlgradient(loss, net.Learnables);
+end
+
+Integration Solver
+function U = solveBurgers(X, t, nu)
+% Define functions.
+f = @(y) exp(-cos(pi*y)/(2*pi*nu));
+g = @(y) exp(-(y.^2)/(4*nu*t));
+
+% Initialize solutions. Size should be ng + 1 to ensure proper dimensions
+U = zeros(numel(X), 1);
+
+% Loop over x values (starting from the second element to ignore the first row)
+for i = 1:numel(X)
+x = X(i); % Adjust index to match the X values properly
+
+% Calculate the solutions using the integral function. The boundary
+% conditions in x = -1 and x = 1 are known, so leave 0 as they are
+% given by initialization of U.
+if abs(x) ~= 1
+fun = @(eta) sin(pi*(x-eta)) .* f(x-eta) .* g(eta);
+uxt = -integral(fun, -inf, inf);
+fun = @(eta) f(x-eta) .* g(eta);
+U(i) = uxt / integral(fun, -inf, inf);
+end
+end
+end
